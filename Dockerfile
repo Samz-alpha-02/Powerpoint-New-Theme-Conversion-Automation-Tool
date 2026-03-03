@@ -34,9 +34,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY app.py              ./app.py
 COPY template_applier.py ./template_applier.py
 
-# Copy Streamlit server config (headless, disables CORS/XSRF for container use)
-COPY .streamlit/config.toml ./.streamlit/config.toml
-
 # ── Expose the port Streamlit listens on ─────────────────────────────────────
 # Render overrides this via the $PORT env variable; the CMD below honours it.
 EXPOSE ${PORT}
