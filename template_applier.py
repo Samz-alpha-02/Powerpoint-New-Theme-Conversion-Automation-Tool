@@ -29,6 +29,8 @@ the template slides – no shape-tree copying between packages is required.
 
 import copy
 import logging
+import math
+import struct
 from io import BytesIO
 from typing import Callable, Optional
 
@@ -40,11 +42,26 @@ from pptx.opc.packuri import PackURI
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Media relationship keywords
+# Relationship-type tokens we must NOT follow when deep-copying a slide's
+# content into the template package.  These tokens either point backwards
+# toward the slide master / layout hierarchy (already present in the
+# template) or are housekeeping parts that should not be duplicated.
 # ---------------------------------------------------------------------------
-_MEDIA_KWDS = (
-    "image", "chart", "diagram", "oleObject", "ole", "audio", "video", "media",
-)
+_SKIP_REL_TOKENS: frozenset = frozenset({
+    "slide",          # backward: slide → slide (notes)
+    "slideMaster",    # backward: slide → master
+    "slideLayout",    # backward: slide → layout
+    "notesSlide",     # notes slide (handled separately)
+    "notesMaster",    # master-level
+    "handoutMaster",  # master-level
+    "officeDocument", # root-level
+    "theme",          # theme already inside template – don't duplicate
+    "viewProps",      # presentation-level metadata
+    "tableStyles",    # presentation-level metadata
+    "presProps",      # presentation-level metadata
+    "commentAuthors", # optional / may not exist in template
+    "comments",       # optional
+})
 
 # ---------------------------------------------------------------------------
 # Theme font helpers
@@ -119,33 +136,118 @@ def _unique_partname(package, base: str) -> PackURI:
         i += 1
 
 
-def _copy_slide_media(src_part, dst_part) -> dict:
+def _copy_part_recursive(src_part, dst_pkg, visited: dict):
     """
-    Copy media / hyperlink rels from src_part → dst_part (possibly different
-    packages).  Returns {old_rId: new_rId}.
+    Deep-copy *src_part* and all its transitive sub-parts into *dst_pkg*.
+
+    *visited* maps str(src partname) → dst Part so that shared parts (e.g.
+    the same image used on multiple slides) are only copied once and circular
+    dependency chains are broken.
+
+    Returns the new Part in dst_pkg, or None on failure.
     """
     from pptx.opc.package import Part
 
-    rId_map: dict = {}
-    dst_pkg = dst_part.package
+    src_pn = str(src_part.partname)
+    if src_pn in visited:
+        return visited[src_pn]
+
+    # Retrieve the raw bytes of this part
+    try:
+        blob = src_part.blob                         # works for all Part types
+    except Exception:
+        try:
+            blob = etree.tostring(
+                src_part._element,                   # type: ignore[attr-defined]
+                xml_declaration=True,
+                encoding="UTF-8",
+                standalone=True,
+            )
+        except Exception:
+            logger.debug("Cannot get blob for part %s – skipping", src_pn)
+            return None
+
+    new_pn = _unique_partname(dst_pkg, src_pn)
+    try:
+        new_part = Part(new_pn, src_part.content_type, dst_pkg, blob)
+    except Exception as exc:
+        logger.debug("Cannot create Part %s: %s", new_pn, exc)
+        return None
+
+    # Register *before* recursing to break potential cycles
+    visited[src_pn] = new_part
+
+    # Build old_rId → new_rId mapping so the blob can be patched afterwards
+    sub_rId_map: dict = {}
+    for old_rId, rel in list(src_part.rels.items()):
+        try:
+            reltype = rel.reltype or ""
+            token   = reltype.rstrip("/").split("/")[-1]
+            if rel.is_external:
+                if "hyperlink" in token:
+                    new_rid = new_part.relate_to(rel.target_ref, reltype, is_external=True)
+                    sub_rId_map[old_rId] = new_rid
+                continue
+            if token in _SKIP_REL_TOKENS:
+                continue
+            child = _copy_part_recursive(rel._target, dst_pkg, visited)  # type: ignore[attr-defined]
+            if child is not None:
+                new_rid = new_part.relate_to(child, reltype)
+                sub_rId_map[old_rId] = new_rid
+        except Exception as exc:
+            logger.debug("Sub-rel skip (%s): %s", src_pn, exc)
+
+    # Patch any rId attribute values in the blob so they match the new rIds.
+    # This is critical for XML parts like chart1.xml which embed references
+    # such as <c:chart r:id="rId3"/> – if the assigned new rId differs from
+    # the original, PowerPoint will report a repair error.
+    if sub_rId_map:
+        try:
+            root = etree.fromstring(new_part.blob)
+            _remap_rids(root, sub_rId_map)
+            new_part.blob = etree.tostring(
+                root,
+                xml_declaration=True,
+                encoding="UTF-8",
+                standalone=True,
+            )
+        except Exception:
+            pass  # Binary part (image, xlsx) – no rId references to patch
+
+    return new_part
+
+
+def _copy_slide_media(src_part, dst_part) -> dict:
+    """
+    Copy ALL content relationships from *src_part* to *dst_part* (which live
+    in different OPC packages).  Recursively copies every sub-part so that
+    charts, SmartArt, embedded objects and their dependent data parts are all
+    present in the destination package.
+
+    Returns {old_rId: new_rId}.
+    """
+    rId_map: dict  = {}
+    dst_pkg        = dst_part.package
+    visited: dict  = {}   # shared across all top-level rels → avoids duplicates
 
     for old_rId, rel in list(src_part.rels.items()):
         try:
             reltype = rel.reltype or ""
+            token   = reltype.rstrip("/").split("/")[-1]
             if rel.is_external:
-                if "hyperlink" in reltype.lower():
+                if "hyperlink" in token:
                     rId_map[old_rId] = dst_part.relate_to(
                         rel.target_ref, reltype, is_external=True
                     )
                 continue
-            if not any(kw in reltype for kw in _MEDIA_KWDS):
+            if token in _SKIP_REL_TOKENS:
                 continue
-            tgt          = rel._target                              # type: ignore[attr-defined]
-            new_partname = _unique_partname(dst_pkg, tgt.partname)
-            new_part     = Part(new_partname, tgt.content_type, dst_pkg, tgt.blob)  # type: ignore[attr-defined]
-            rId_map[old_rId] = dst_part.relate_to(new_part, reltype)
+            new_part = _copy_part_recursive(rel._target, dst_pkg, visited)  # type: ignore[attr-defined]
+            if new_part is not None:
+                rId_map[old_rId] = dst_part.relate_to(new_part, reltype)
         except Exception as exc:
-            logger.debug("Skipping rel %s: %s", old_rId, exc)
+            logger.debug("Slide rel skip %s: %s", old_rId, exc)
+
     return rId_map
 
 
@@ -153,20 +255,21 @@ def _copy_slide_media_intra(src_part, dst_part) -> dict:
     """
     Copy media / hyperlink rels from src_part → dst_part when **both parts
     live in the same OPC package** (e.g. duplicating a slide within dst_prs).
-    We reuse the existing Part objects – just create new relationships.
+    We reuse the existing Part objects – just create new relationship entries.
     Returns {old_rId: new_rId}.
     """
     rId_map: dict = {}
     for old_rId, rel in list(src_part.rels.items()):
         try:
             reltype = rel.reltype or ""
+            token   = reltype.rstrip("/").split("/")[-1]
             if rel.is_external:
-                if "hyperlink" in reltype.lower():
+                if "hyperlink" in token:
                     rId_map[old_rId] = dst_part.relate_to(
                         rel.target_ref, reltype, is_external=True
                     )
                 continue
-            if not any(kw in reltype for kw in _MEDIA_KWDS):
+            if token in _SKIP_REL_TOKENS:
                 continue
             # Reuse the actual same Part object (same package) – no blob copy
             rId_map[old_rId] = dst_part.relate_to(rel._target, reltype)  # type: ignore[attr-defined]
@@ -345,12 +448,30 @@ def _strip_text_colours(sp_tree: etree._Element) -> None:
 # Ensure layout-inherited placeholders are materialised in the slide XML
 # ---------------------------------------------------------------------------
 
+def _next_shape_id(sp_tree) -> int:
+    """Return max(existing cNvPr id) + 1 for shapes in *sp_tree*."""
+    max_id = 0
+    for el in sp_tree.iter():
+        if el.tag == qn("p:cNvPr"):
+            try:
+                val = int(el.get("id", 0))
+                if val > max_id:
+                    max_id = val
+            except (ValueError, TypeError):
+                pass
+    return max_id + 1
+
+
 def _ensure_slide_placeholders(slide) -> None:
     """
     When a slide inherits a placeholder from its layout without overriding it,
     no <p:sp> element exists in the slide's own spTree.  We can't inject
     content into a non-existent element, so we clone a minimal blank override
     from the layout for every ph-idx that is missing at the slide level.
+
+    Shape IDs are reassigned to avoid collisions with shapes already on the
+    slide (duplicate IDs in a spTree cause PowerPoint to refuse to open the
+    file).
     """
     sp_tree = slide.shapes._spTree
     existing_idx: set = set()
@@ -377,6 +498,10 @@ def _ensure_slide_placeholders(slide) -> None:
             continue
         # Clone the layout shape; strip its hint text so nothing leaks through
         new_sp = copy.deepcopy(layout_sp)
+        # ── Assign a fresh, unique id so no collision with existing shapes ──
+        cNvPr = new_sp.find(".//" + qn("p:cNvPr"))
+        if cNvPr is not None:
+            cNvPr.set("id", str(_next_shape_id(sp_tree)))
         txBody = new_sp.find(qn("p:txBody"))
         if txBody is not None:
             for p in list(txBody.findall(qn("a:p"))):
@@ -461,6 +586,10 @@ def _inject_into_textboxes(src_slide, dst_slide, src_rId_map: dict) -> None:
 
     src_ordered = src_title_elems + src_content_elems
 
+    # Nothing to inject – leave template TextBoxes intact rather than wiping them
+    if not src_ordered:
+        return
+
     # Inject: template TextBox[0] ← src[0] (title), TextBox[1] ← src[1] …
     # First clear ALL template TextBoxes so sample text never leaks through
     for tpl_tb in tpl_tbs:
@@ -475,6 +604,182 @@ def _inject_into_textboxes(src_slide, dst_slide, src_rId_map: dict) -> None:
         _remap_rids(tpl_tb, src_rId_map)
 
     _strip_text_colours(dst_sp_tree)
+
+
+# ---------------------------------------------------------------------------
+# Salvage: reconstruct shapes for orphaned content rels
+# (charts / images registered in slide rels but not used in any shape element)
+# ---------------------------------------------------------------------------
+
+def _image_dims(blob: bytes):
+    """Return (width, height) in pixels from PNG or JPEG blob, or None."""
+    try:
+        if blob[:8] == b'\x89PNG\r\n\x1a\n':
+            w, h = struct.unpack('>II', blob[16:24])
+            return w, h
+        if blob[:2] == b'\xff\xd8':
+            i = 2
+            while i < len(blob) - 4:
+                if blob[i] != 0xFF:
+                    break
+                m = blob[i + 1]
+                if m in (0xC0,0xC1,0xC2,0xC3,0xC5,0xC6,0xC7,0xC9,0xCA,0xCB,0xCD,0xCE,0xCF):
+                    h, w = struct.unpack('>HH', blob[i + 5:i + 9])
+                    return w, h
+                length = struct.unpack('>H', blob[i + 2:i + 4])[0]
+                i += 2 + length
+    except Exception:
+        pass
+    return None
+
+
+_NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_NS_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _salvage_orphaned_rels(src_slide, dst_slide, src_rId_map: dict) -> None:
+    """
+    When a source slide contains content parts (charts, images) that are
+    registered as OPC relationships but have NO corresponding shape element in
+    the slide XML, our tool would otherwise leave those parts as orphaned rels
+    in the output — producing a slide that looks blank even though data exists.
+
+    This function detects such orphaned rels and constructs minimal display
+    shapes in dst_slide so the content is visible after rebranding:
+
+    • Chart rel  → <p:graphicFrame> pointing to the copied chart part.
+    • Image rel  → <p:pic> blipFill element (landscape/square images only;
+                   portrait images that look like logos are skipped).
+
+    Multiple shapes are arranged in an auto-calculated grid inside the
+    slide's content area.
+    """
+    if not src_rId_map:
+        return
+
+    # ── Build old_rId → reltype token for every src slide rel ──────────────
+    src_rel_types: dict = {}
+    src_rel_parts: dict = {}   # old_rId → Part object in src
+    for old_rId, rel in src_slide.part.rels.items():
+        token = (rel.reltype or "").rstrip("/").split("/")[-1]
+        src_rel_types[old_rId] = token
+        if not rel.is_external:
+            src_rel_parts[old_rId] = rel._target   # type: ignore[attr-defined]
+
+    # ── Find which new_rIds are already referenced somewhere in dst spTree ─
+    dst_sp_tree = dst_slide.shapes._spTree
+    dst_xml_str  = etree.tostring(dst_sp_tree).decode()
+    referenced   = {v for v in src_rId_map.values() if v in dst_xml_str}
+
+    # ── Categorise orphaned rels ────────────────────────────────────────────
+    orphaned_charts: list = []   # new_rIds
+    orphaned_images: list = []   # (new_rId, width_px, height_px)
+
+    for old_rId, new_rId in src_rId_map.items():
+        if new_rId in referenced:
+            continue
+        token = src_rel_types.get(old_rId, "")
+        if token == "chart":
+            orphaned_charts.append(new_rId)
+        elif token == "image":
+            dims = None
+            try:
+                part = src_rel_parts.get(old_rId)
+                if part is not None:
+                    dims = _image_dims(part.blob)
+            except Exception:
+                pass
+            w, h = dims if dims else (1, 1)
+            # Skip portrait images (likely logos/backgrounds repeated on slides)
+            if h > w:
+                continue
+            orphaned_images.append((new_rId, w, h))
+
+    if not orphaned_charts and not orphaned_images:
+        return
+
+    # ── Content area in EMU (fits most standard 10"×7.5" slide templates) ──
+    SLIDE_W   = 9144000
+    MARGIN_X  = 457200          # 0.5"
+    TOP_Y     = 1257300         # below typical header bar (~1.375")
+    BOTTOM_Y  = 6400800         # above typical footer bar
+    AREA_CX   = SLIDE_W - 2 * MARGIN_X
+    AREA_CY   = BOTTOM_Y - TOP_Y
+
+    all_items = (
+        [("chart", r) for r in orphaned_charts] +
+        [("image", r, w, h) for r, w, h in orphaned_images]
+    )
+    n = len(all_items)
+    cols = max(1, math.ceil(math.sqrt(n)))
+    rows = max(1, math.ceil(n / cols))
+    cell_cx = AREA_CX // cols
+    cell_cy = AREA_CY // rows
+
+    for idx, item in enumerate(all_items):
+        col  = idx % cols
+        row  = idx // cols
+        x    = MARGIN_X + col * cell_cx
+        y    = TOP_Y    + row * cell_cy
+        sid  = _next_shape_id(dst_sp_tree)
+
+        kind = item[0]
+        new_rId = item[1]
+
+        try:
+            if kind == "chart":
+                gf_xml = (
+                    f'<p:graphicFrame'
+                    f' xmlns:p="{_NS_P}"'
+                    f' xmlns:a="{_NS_A}"'
+                    f' xmlns:c="{_NS_C}"'
+                    f' xmlns:r="{_NS_R}">'
+                    f'<p:nvGraphicFramePr>'
+                    f'<p:cNvPr id="{sid}" name="Chart {idx+1}"/>'
+                    f'<p:cNvGraphicFramePr>'
+                    f'<a:graphicFrameLocks noGrp="1"/>'
+                    f'</p:cNvGraphicFramePr>'
+                    f'<p:nvPr/>'
+                    f'</p:nvGraphicFramePr>'
+                    f'<p:xfrm>'
+                    f'<a:off x="{x}" y="{y}"/>'
+                    f'<a:ext cx="{cell_cx}" cy="{cell_cy}"/>'
+                    f'</p:xfrm>'
+                    f'<a:graphic>'
+                    f'<a:graphicData uri="{_NS_C}">'
+                    f'<c:chart r:id="{new_rId}"/>'
+                    f'</a:graphicData>'
+                    f'</a:graphic>'
+                    f'</p:graphicFrame>'
+                )
+                dst_sp_tree.append(etree.fromstring(gf_xml))
+
+            else:   # image
+                pic_xml = (
+                    f'<p:pic'
+                    f' xmlns:p="{_NS_P}"'
+                    f' xmlns:a="{_NS_A}"'
+                    f' xmlns:r="{_NS_R}">'
+                    f'<p:nvPicPr>'
+                    f'<p:cNvPr id="{sid}" name="Image {idx+1}"/>'
+                    f'<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>'
+                    f'<p:nvPr/>'
+                    f'</p:nvPicPr>'
+                    f'<p:blipFill>'
+                    f'<a:blip r:embed="{new_rId}"/>'
+                    f'<a:stretch><a:fillRect/></a:stretch>'
+                    f'</p:blipFill>'
+                    f'<p:spPr>'
+                    f'<a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cell_cx}" cy="{cell_cy}"/></a:xfrm>'
+                    f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+                    f'</p:spPr>'
+                    f'</p:pic>'
+                )
+                dst_sp_tree.append(etree.fromstring(pic_xml))
+        except Exception as exc:
+            logger.debug("Salvage shape %d failed: %s", idx, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -532,9 +837,12 @@ def _inject_content(src_slide, dst_slide) -> None:
         # No real content placeholders found – skip straight to textbox injection
         _strip_text_colours(dst_sp_tree)
         _inject_into_textboxes(src_slide, dst_slide, src_rId_map)
+        # Still run salvage — source may have charts/images with no shape elements
+        _salvage_orphaned_rels(src_slide, dst_slide, src_rId_map)
         return
 
     # ── 4. Inject source placeholder content ──────────────────────────────
+    injected = 0   # track how many placeholders received content
     for src_shape in list(src_sp_tree)[2:]:
         if not _is_placeholder(src_shape):
             continue  # skip old-template decorations – they'd land off-canvas
@@ -560,6 +868,7 @@ def _inject_content(src_slide, dst_slide) -> None:
 
         # Copy text content
         _copy_text_content(src_shape, dst_shape)
+        injected += 1
 
         # Remap hyperlink / media rIds inside copied text
         _remap_rids(dst_shape, src_rId_map)
@@ -576,9 +885,10 @@ def _inject_content(src_slide, dst_slide) -> None:
     # ── 5. Strip text colour overrides ────────────────────────────────────
     _strip_text_colours(dst_sp_tree)
 
-    # ── 6. Fallback: if NO placeholders were injected, try textbox matching ─
+    # ── 6. Fallback: ONLY if no placeholder injection occurred, try TextBox ─
     # (happens when the template uses plain TextBoxes instead of Placeholders)
-    _inject_into_textboxes(src_slide, dst_slide, src_rId_map)
+    if injected == 0:
+        _inject_into_textboxes(src_slide, dst_slide, src_rId_map)
 
     # ── 7. Copy slide notes ────────────────────────────────────────────────
     try:
@@ -591,6 +901,12 @@ def _inject_content(src_slide, dst_slide) -> None:
             dst_txBody.append(copy.deepcopy(p))
     except Exception:
         pass
+
+    # ── 8. Salvage content rels that have no shape XML yet ────────────────
+    # Handles presentations where charts/images are in the OPC package but
+    # the corresponding <p:graphicFrame> / <p:pic> elements were never written
+    # to the slide XML (e.g. apps that save PPTX with orphaned rels).
+    _salvage_orphaned_rels(src_slide, dst_slide, src_rId_map)
 
 # ---------------------------------------------------------------------------
 # Font & overflow helpers
