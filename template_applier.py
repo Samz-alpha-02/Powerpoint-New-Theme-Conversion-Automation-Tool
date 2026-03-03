@@ -35,6 +35,7 @@ from typing import Callable, Optional
 from lxml import etree
 from pptx import Presentation
 from pptx.oxml.ns import qn
+from pptx.opc.packuri import PackURI
 
 logger = logging.getLogger(__name__)
 
@@ -105,16 +106,16 @@ def _best_layout(template_prs: Presentation, old_name: str):
 # OPC helpers
 # ---------------------------------------------------------------------------
 
-def _unique_partname(package, base: str) -> str:
+def _unique_partname(package, base: str) -> PackURI:
     existing = {p.partname for p in package.iter_parts()}
     if base not in existing:
-        return base
+        return PackURI(base)
     stem, _, ext = base.rpartition(".")
     i = 2
     while True:
         cand = f"{stem}_{i}.{ext}" if ext else f"{stem}_{i}"
         if cand not in existing:
-            return cand
+            return PackURI(cand)
         i += 1
 
 
