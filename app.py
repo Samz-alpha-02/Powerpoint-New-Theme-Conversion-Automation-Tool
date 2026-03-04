@@ -1306,6 +1306,21 @@ if _marked_indices and st.session_state.images:
         0, 20, 8, key="multi_thresh",
     )
 
+    with st.expander("\U0001f524 Also replace text in this document (optional)"):
+        _tr_c1sf, _tr_c2sf = st.columns(2)
+        with _tr_c1sf:
+            _tr_old_sf = st.text_input(
+                "Find text",
+                value="LTIMindtree | Privileged and Confidential",
+                key="tr_old_sf",
+            )
+        with _tr_c2sf:
+            _tr_new_sf = st.text_input(
+                "Replace with",
+                value="LTM | Privileged and Confidential",
+                key="tr_new_sf",
+            )
+
     if st.button(
         f"\U0001f504 Replace {len(_marked_imgs)} logo image{'s' if len(_marked_imgs) != 1 else ''} in document",
         type="primary",
@@ -1318,10 +1333,19 @@ if _marked_indices and st.session_state.images:
             _out_bytes, _count = replace_multiple_logos_any(
                 fbytes_sf, name_sf, _old_refs, _new_bytes, _thr_multi
             )
-        if _count == 0:
-            st.warning("No replacements made. Try raising the sensitivity slider.")
+        _tr_count_sf = 0
+        if ext_sf in (".pptx", ".docx", ".doc") and _tr_old_sf.strip():
+            with st.spinner("Replacing text\u2026"):
+                _out_bytes, _tr_count_sf = replace_text_any(
+                    _out_bytes, name_sf, _tr_old_sf.strip(), _tr_new_sf
+                )
+        if _count == 0 and _tr_count_sf == 0:
+            st.warning("No replacements made. Try raising the sensitivity slider or checking the text.")
         else:
-            st.success(f"Replaced **{_count}** logo instance(s) across all locations.")
+            _parts = []
+            if _count:       _parts.append(f"**{_count}** logo instance(s)")
+            if _tr_count_sf: _parts.append(f"**{_tr_count_sf}** text occurrence(s)")
+            st.success(f"Replaced {' and '.join(_parts)}.")
         _download_doc("\u2b07\ufe0f Download updated document", _out_bytes, stem_sf, ext_sf)
 
 # ── Step 4: Inspect / region-detect for a single selected image ─────────────
@@ -1524,18 +1548,49 @@ if doc_file and not is_zip:
                 key="tr_new",
             )
 
-        if st.button("🔤 Replace Text", type="primary", disabled=not _tr_old, key="btn_tr"):
-            with st.spinner("Replacing text…"):
-                _tr_out, _tr_count = replace_text_any(_fbytes_tr, _name_tr, _tr_old, _tr_new)
-            if _tr_count == 0:
+        # Offer to also apply logo replacement if logos are already marked + new logo uploaded
+        _tr_logo_file = st.session_state.get("multi_new_logo")
+        _tr_can_combine = bool(
+            st.session_state.get("selected_set")
+            and st.session_state.images
+            and _tr_logo_file is not None
+        )
+        _tr_also_logos = False
+        if _tr_can_combine:
+            _tr_also_logos = st.checkbox(
+                "Also apply the logo replacement marked in Step 3 (produces a single combined file)",
+                value=True, key="tr_also_logos",
+            )
+
+        if st.button("\U0001f524 Replace Text", type="primary", disabled=not _tr_old, key="btn_tr"):
+            _working = _fbytes_tr
+            _logo_n  = 0
+            if _tr_also_logos and _tr_logo_file is not None:
+                _tr_logo_file.seek(0)
+                _tr_marked = [
+                    st.session_state.images[i]
+                    for i in sorted(st.session_state.selected_set)
+                ]
+                _old_refs_tr = [_m["bytes"] for _m in _tr_marked]
+                _thr_tr = st.session_state.get("multi_thresh", 8)
+                with st.spinner("Replacing logos\u2026"):
+                    _working, _logo_n = replace_multiple_logos_any(
+                        _working, _name_tr, _old_refs_tr, _tr_logo_file.read(), _thr_tr
+                    )
+            with st.spinner("Replacing text\u2026"):
+                _tr_out, _tr_count = replace_text_any(_working, _name_tr, _tr_old, _tr_new)
+            if _tr_count == 0 and _logo_n == 0:
                 st.warning(
-                    "Text not found in the document. "
+                    "No replacements made. "
                     "Check the exact spelling and capitalisation, then try again."
                 )
             else:
-                st.success(f"Replaced **{_tr_count}** occurrence(s).")
+                _parts = []
+                if _logo_n:   _parts.append(f"**{_logo_n}** logo instance(s)")
+                if _tr_count: _parts.append(f"**{_tr_count}** text occurrence(s)")
+                st.success(f"Replaced {' and '.join(_parts)}.")
             _stem_tr = os.path.splitext(_name_tr)[0]
-            _download_doc("⬇️ Download updated document", _tr_out, _stem_tr, _ext_tr)
+            _download_doc("\u2b07\ufe0f Download updated document", _tr_out, _stem_tr, _ext_tr)
 
 elif doc_file and not is_zip and not st.session_state.images:
     st.info("Click **Scan document for all embedded images** above to get started.")
