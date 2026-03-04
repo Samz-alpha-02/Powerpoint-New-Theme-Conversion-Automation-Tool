@@ -408,6 +408,14 @@ def embed_image_in_document(
 
 def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
     from pptx import Presentation
+    from pptx.shapes.shapetree import _BaseGroupShapes, MasterShapes, LayoutShapes
+
+    # MasterShapes and LayoutShapes don't inherit _BaseGroupShapes, so they lack
+    # add_picture and its helpers. Patch them in so masters/layouts are handled.
+    for _cls in (MasterShapes, LayoutShapes):
+        for _attr in ("add_picture", "_add_pic_from_image_part", "_recalculate_extents"):
+            if not hasattr(_cls, _attr):
+                setattr(_cls, _attr, getattr(_BaseGroupShapes, _attr))
 
     old_hash = get_image_hash(old_logo_bytes)
     new_png  = to_png(new_logo_bytes)
