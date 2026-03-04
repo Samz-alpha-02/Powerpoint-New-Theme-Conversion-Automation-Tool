@@ -407,59 +407,28 @@ def embed_image_in_document(
 # ============================================================
 
 def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
-    from pptx import Presentation
-    from pptx.shapes.shapetree import _BaseGroupShapes, MasterShapes, LayoutShapes
-
-    # MasterShapes and LayoutShapes inherit _BaseShapes (not _BaseGroupShapes), so
-    # they store their root CT_GroupShape as `_spTree` rather than `_grpSp`, and
-    # they lack add_picture and its helpers.  Patch them so masters/layouts work:
-    #   • expose `_grpSp` as an alias for `_spTree` (same object, different name)
-    #   • borrow add_picture and _add_pic_from_image_part from _BaseGroupShapes
-    #   • provide a no-op _recalculate_extents (masters have no group-extent logic)
-    for _cls in (MasterShapes, LayoutShapes):
-        if not hasattr(_cls, "_grpSp"):
-            _cls._grpSp = property(lambda self: self._spTree)
-        for _attr in ("add_picture", "_add_pic_from_image_part"):
-            if not hasattr(_cls, _attr):
-                setattr(_cls, _attr, getattr(_BaseGroupShapes, _attr))
-        if not hasattr(_cls, "_recalculate_extents"):
-            _cls._recalculate_extents = lambda self: None
-
+    """
+    Replace matching logos in a PPTX by swapping image bytes directly inside
+    the ZIP (ppt/media/*).  The slide/master/layout XML is never touched, so
+    all shapes, graphics, z-order, animations and formatting stay intact.
+    """
     old_hash = get_image_hash(old_logo_bytes)
     new_png  = to_png(new_logo_bytes)
-    temp_dir = tempfile.mkdtemp()
-    try:
-        inp = os.path.join(temp_dir, "in.pptx")
-        out = os.path.join(temp_dir, "out.pptx")
-        with open(inp, "wb") as f:
-            f.write(pptx_bytes)
-
-        prs   = Presentation(inp)
-        count = 0
-
-        def process(tree):
-            nonlocal count
-            for pic in _collect_pics(tree):
+    buf, count = BytesIO(), 0
+    with zipfile.ZipFile(BytesIO(pptx_bytes)) as zin, \
+         zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.lower().startswith("ppt/media/"):
                 try:
-                    blob = pic.image.blob
+                    if old_hash - get_image_hash(data) <= threshold:
+                        zout.writestr(item.filename, new_png)
+                        count += 1
+                        continue
                 except Exception:
-                    continue
-                if old_hash - get_image_hash(blob) <= threshold:
-                    l, t, w, h = pic.left, pic.top, pic.width, pic.height
-                    pic._element.getparent().remove(pic._element)
-                    tree.add_picture(BytesIO(new_png), l, t, w, h)
-                    count += 1
-
-        process(prs.slide_master.shapes)
-        for layout in prs.slide_master.slide_layouts:
-            process(layout.shapes)
-        for slide in prs.slides:
-            process(slide.shapes)
-
-        prs.save(out)
-        return open(out, "rb").read(), count
-    finally:
-        shutil.rmtree(temp_dir)
+                    pass
+            zout.writestr(item.filename, data)
+    return buf.getvalue(), count
 
 
 def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
