@@ -410,12 +410,20 @@ def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
     from pptx import Presentation
     from pptx.shapes.shapetree import _BaseGroupShapes, MasterShapes, LayoutShapes
 
-    # MasterShapes and LayoutShapes don't inherit _BaseGroupShapes, so they lack
-    # add_picture and its helpers. Patch them in so masters/layouts are handled.
+    # MasterShapes and LayoutShapes inherit _BaseShapes (not _BaseGroupShapes), so
+    # they store their root CT_GroupShape as `_spTree` rather than `_grpSp`, and
+    # they lack add_picture and its helpers.  Patch them so masters/layouts work:
+    #   • expose `_grpSp` as an alias for `_spTree` (same object, different name)
+    #   • borrow add_picture and _add_pic_from_image_part from _BaseGroupShapes
+    #   • provide a no-op _recalculate_extents (masters have no group-extent logic)
     for _cls in (MasterShapes, LayoutShapes):
-        for _attr in ("add_picture", "_add_pic_from_image_part", "_recalculate_extents"):
+        if not hasattr(_cls, "_grpSp"):
+            _cls._grpSp = property(lambda self: self._spTree)
+        for _attr in ("add_picture", "_add_pic_from_image_part"):
             if not hasattr(_cls, _attr):
                 setattr(_cls, _attr, getattr(_BaseGroupShapes, _attr))
+        if not hasattr(_cls, "_recalculate_extents"):
+            _cls._recalculate_extents = lambda self: None
 
     old_hash = get_image_hash(old_logo_bytes)
     new_png  = to_png(new_logo_bytes)
