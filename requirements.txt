@@ -1,14 +1,5 @@
-# PowerPoint Rebranding Tool – Python dependencies
-# Install with:  pip install -r requirements.txt
-
-# Core PPTX manipulation
+streamlit>=1.33.0
 python-pptx>=0.6.23
-
-# XML processing (ships with python-pptx but pinned for safety)
-lxml>=4.9.0
-
-# Web UI
-streamlit>=1.35.0
-
-# Pillow is used internally by python-pptx for image handling
-Pillow>=10.0.0
+Pillow>=10.3.0
+ImageHash>=4.3.1
+PyMuPDF>=1.24.0
