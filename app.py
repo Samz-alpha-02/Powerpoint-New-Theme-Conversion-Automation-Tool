@@ -508,6 +508,102 @@ def replace_multiple_logos_any(
     return data, total
 
 
+# ============================================================
+# TEXT REPLACEMENT  (handles split runs across a:r / w:r)
+# ============================================================
+
+def _replace_text_in_xml(xml_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
+    """
+    Replace text in a single PPTX/DOCX XML part, handling text that may be
+    split across multiple <a:r> or <w:r> run elements within a paragraph.
+    Only modifies <a:t>/<w:t> text nodes; all other XML is untouched.
+    Returns (modified_bytes, replacement_count).
+    """
+    from lxml import etree
+    _A     = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    _W     = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    _SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+    count  = 0
+
+    try:
+        root = etree.fromstring(xml_bytes)
+    except Exception:
+        return xml_bytes, 0
+
+    for p_tag, r_tag, t_tag in [
+        (f"{{{_A}}}p", f"{{{_A}}}r", f"{{{_A}}}t"),
+        (f"{{{_W}}}p", f"{{{_W}}}r", f"{{{_W}}}t"),
+    ]:
+        for para in root.iter(p_tag):
+            runs   = para.findall(r_tag)
+            telems = [r.find(t_tag) for r in runs]
+            telems = [t for t in telems if t is not None]
+            if not telems:
+                continue
+            full = "".join(t.text or "" for t in telems)
+            if old_text not in full:
+                continue
+            new_full = full.replace(old_text, new_text)
+            count   += full.count(old_text)
+            telems[0].text = new_full
+            if new_full != new_full.strip():
+                telems[0].set(_SPACE, "preserve")
+            for t in telems[1:]:
+                t.text = ""
+
+    if count == 0:
+        return xml_bytes, 0
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), count
+
+
+def replace_text_pptx(pptx_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
+    """Replace text across all slides, masters, layouts and notes in a PPTX."""
+    XML_DIRS = (
+        "ppt/slides/", "ppt/slidelayouts/", "ppt/slidemasters/",
+        "ppt/notesslides/", "ppt/handoutmasters/", "ppt/notesmasters/",
+    )
+    total = 0
+    buf   = BytesIO()
+    with zipfile.ZipFile(BytesIO(pptx_bytes)) as zin, \
+         zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data  = zin.read(item.filename)
+            fname = item.filename.lower()
+            if fname.endswith(".xml") and any(fname.startswith(d) for d in XML_DIRS):
+                modified, n = _replace_text_in_xml(data, old_text, new_text)
+                if n:
+                    data   = modified
+                    total += n
+            zout.writestr(item.filename, data)
+    return buf.getvalue(), total
+
+
+def replace_text_docx(docx_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
+    """Replace text across all XML parts in a DOCX."""
+    total = 0
+    buf   = BytesIO()
+    with zipfile.ZipFile(BytesIO(docx_bytes)) as zin, \
+         zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.lower().endswith(".xml"):
+                modified, n = _replace_text_in_xml(data, old_text, new_text)
+                if n:
+                    data   = modified
+                    total += n
+            zout.writestr(item.filename, data)
+    return buf.getvalue(), total
+
+
+def replace_text_any(file_bytes: bytes, filename: str, old_text: str, new_text: str) -> tuple[bytes, int]:
+    ext = os.path.splitext(filename.lower())[1]
+    if ext == ".pptx":
+        return replace_text_pptx(file_bytes, old_text, new_text)
+    if ext in (".docx", ".doc"):
+        return replace_text_docx(file_bytes, old_text, new_text)
+    raise ValueError(f"Text replacement not supported for {ext}")
+
+
 def process_zip(zip_bytes, old_logo_bytes, new_logo_bytes, threshold):
     """Hash-based whole-image replacement across all files in a ZIP."""
     buf, total, files = BytesIO(), 0, 0
@@ -1401,6 +1497,45 @@ if st.session_state.selected is not None:
 
                 st.success("Done! The logo region has been replaced in the document.")
                 _download_doc("⬇️ Download updated document", out_bytes, stem, ext)
+
+# ── Text Replacement ─────────────────────────────────────────────────────────
+
+if doc_file and not is_zip:
+    _name_tr, _fbytes_tr = st.session_state.doc_cache
+    _ext_tr = os.path.splitext(_name_tr.lower())[1]
+    if _ext_tr in (".pptx", ".docx", ".doc"):
+        st.divider()
+        st.subheader("🔤 Text Replacement")
+        st.caption(
+            "Finds and replaces text anywhere in the document — slides, masters, layouts, notes pages. "
+            "Works even when the text is split across multiple formatting runs in the XML."
+        )
+        _tr_c1, _tr_c2 = st.columns(2)
+        with _tr_c1:
+            _tr_old = st.text_input(
+                "Text to find",
+                value="LTIMindtree | Privileged and Confidential",
+                key="tr_old",
+            )
+        with _tr_c2:
+            _tr_new = st.text_input(
+                "Replace with",
+                value="LTM | Privileged and Confidential",
+                key="tr_new",
+            )
+
+        if st.button("🔤 Replace Text", type="primary", disabled=not _tr_old, key="btn_tr"):
+            with st.spinner("Replacing text…"):
+                _tr_out, _tr_count = replace_text_any(_fbytes_tr, _name_tr, _tr_old, _tr_new)
+            if _tr_count == 0:
+                st.warning(
+                    "Text not found in the document. "
+                    "Check the exact spelling and capitalisation, then try again."
+                )
+            else:
+                st.success(f"Replaced **{_tr_count}** occurrence(s).")
+            _stem_tr = os.path.splitext(_name_tr)[0]
+            _download_doc("⬇️ Download updated document", _tr_out, _stem_tr, _ext_tr)
 
 elif doc_file and not is_zip and not st.session_state.images:
     st.info("Click **Scan document for all embedded images** above to get started.")
