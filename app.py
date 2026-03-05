@@ -451,10 +451,25 @@ def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
     return buf.getvalue(), count
 
 
+def _to_pdf_safe_png(img_bytes: bytes) -> bytes:
+    """
+    Convert image bytes to an RGB PNG with no alpha channel.
+    PDFs don't support RGBA natively (alpha needs a separate SMask object
+    that PyMuPDF's replace_image doesn't auto-create), so we composite
+    any transparency onto a white background first.
+    """
+    img = Image.open(BytesIO(img_bytes)).convert("RGBA")
+    bg  = Image.new("RGB", img.size, (255, 255, 255))
+    bg.paste(img, mask=img.split()[3])   # alpha-composite onto white
+    buf = BytesIO()
+    bg.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
     import fitz
-    old_hash = get_image_hash(old_logo_bytes)
-    new_png  = to_png(new_logo_bytes)
+    old_hash    = get_image_hash(old_logo_bytes)
+    new_pdf_png = _to_pdf_safe_png(new_logo_bytes)   # RGB PNG, no alpha
     count, done = 0, set()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -466,7 +481,7 @@ def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
                 try:
                     data = doc.extract_image(xref)["image"]
                     if old_hash - get_image_hash(data) <= threshold:
-                        doc.replace_image(xref, stream=new_png)
+                        doc.replace_image(xref, stream=new_pdf_png)
                         done.add(xref)
                         count += 1
                 except Exception:
