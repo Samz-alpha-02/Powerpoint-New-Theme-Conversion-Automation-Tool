@@ -1,28 +1,58 @@
+# =============================================================================
+# Document Logo Replacer — app.py
+# =============================================================================
+# A Streamlit web application that replaces logos and text inside PPTX, DOCX,
+# PDF, and ZIP (batch) files.  The core strategy is always to operate at the
+# raw ZIP / byte level so that none of the document's other content — shapes,
+# animations, XML relationships, z-order — is ever touched or re-serialised.
+# =============================================================================
+
 import os
 import shutil
 import tempfile
 import zipfile
 from io import BytesIO
 
-import imagehash
+import imagehash          # perceptual image hashing (pHash) for visual similarity
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw   # image manipulation and annotation
+
 
 # ============================================================
 # BASIC IMAGE HELPERS
 # ============================================================
 
 def get_image_hash(img_bytes: bytes):
+    """
+    Compute a perceptual hash (pHash) of an image.
+
+    Perceptual hashing produces a 64-bit fingerprint that stays similar for
+    images that are visually alike (e.g. same logo at slightly different
+    resolution or compression).  Two hashes can be compared with `-` to get
+    a Hamming distance: 0 = identical, ~10 = very similar, >20 = different.
+    """
     return imagehash.phash(Image.open(BytesIO(img_bytes)))
 
 
 def to_png(img_bytes: bytes) -> bytes:
+    """
+    Convert any supported image format to a 32-bit RGBA PNG in memory.
+
+    Used when embedding replacement images into PPTX / DOCX ZIP archives,
+    ensuring a consistent, lossless format regardless of what the user uploads.
+    """
     buf = BytesIO()
     Image.open(BytesIO(img_bytes)).convert("RGBA").save(buf, format="PNG")
     return buf.getvalue()
 
 
 def thumbnail_bytes(img_bytes: bytes, size: tuple = (220, 220)) -> bytes:
+    """
+    Create a small RGBA thumbnail for gallery display in the Streamlit UI.
+
+    Uses `Image.thumbnail` which preserves aspect ratio and never upscales.
+    LANCZOS resampling gives the best quality when downscaling.
+    """
     img = Image.open(BytesIO(img_bytes)).convert("RGBA")
     img.thumbnail(size, Image.LANCZOS)
     buf = BytesIO()
@@ -36,9 +66,18 @@ def annotate_bbox(
     color: str = "#ff3300",
     line_width: int = 4,
 ) -> bytes:
-    """Draw a coloured rectangle over the detected region."""
+    """
+    Draw a visible bounding-box rectangle onto an image for preview purposes.
+
+    The rectangle is drawn `line_width` times, each iteration offset by 1 px
+    outward, to produce a thick visible border without using PIL's `width`
+    parameter (which is unavailable on older Pillow builds).
+
+    Returns a PNG byte-string suitable for `st.image()`.
+    """
     img = Image.open(BytesIO(img_bytes)).convert("RGBA")
     draw = ImageDraw.Draw(img)
+    # Draw concentric rectangles expanding outward to simulate line thickness
     for i in range(line_width):
         draw.rectangle([x1 - i, y1 - i, x2 + i, y2 + i], outline=color)
     buf = BytesIO()
@@ -52,7 +91,15 @@ def annotate_bbox(
 
 @st.cache_resource(show_spinner="Loading OCR engine…")
 def _ocr_reader():
-    import easyocr  # noqa: lazy import
+    """
+    Initialise and cache the EasyOCR English reader.
+
+    `@st.cache_resource` ensures the ~300 MB language model is downloaded and
+    loaded into memory only once per Streamlit session, no matter how many
+    times the user triggers detection.  `gpu=False` keeps it CPU-only for
+    broad compatibility.
+    """
+    import easyocr  # lazy import — only needed when OCR mode is used
     return easyocr.Reader(["en"], gpu=False)
 
 
@@ -63,25 +110,42 @@ def detect_by_ocr(
     v_padding_ratio: float = 0.15,
 ) -> dict | None:
     """
-    Find `search_text` in `img_bytes` using EasyOCR.
-    Because the LTIMindtree logo has a circular icon immediately to the *left*
-    of the text, we expand the bounding-box leftward by `expand_left_ratio × text_width`.
+    Locate a text string inside an image using EasyOCR and return its bounding box.
 
-    Returns {"x1","y1","x2","y2","text","confidence"} or None.
+    Because many logos place a graphical icon *immediately to the left* of the
+    text (e.g. the LTIMindtree circular symbol), the detected text bbox is
+    expanded leftward by `expand_left_ratio × text_width` so the full logo
+    (icon + text) is captured as one region.
+
+    Parameters
+    ----------
+    img_bytes         : Raw image bytes (any PIL-readable format).
+    search_text       : The string to look for (case-insensitive substring match).
+    expand_left_ratio : How far left to extend the box relative to text width.
+                        0.9 = expand 90 % of the text width to the left.
+    v_padding_ratio   : Vertical padding added top & bottom as a fraction of
+                        text height, to avoid clipping descenders.
+
+    Returns
+    -------
+    dict with keys x1, y1, x2, y2, text, confidence  — or None if not found.
     """
-    import numpy as np  # noqa
+    import numpy as np
 
-    reader = _ocr_reader()
-    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    reader  = _ocr_reader()
+    img     = Image.open(BytesIO(img_bytes)).convert("RGB")
+    # readtext returns list of (bbox_polygon, text_string, confidence_float)
     results = reader.readtext(np.array(img))
 
     best = None
     for bbox, text, conf in results:
         if search_text.lower() in text.lower():
+            # bbox is a list of 4 (x,y) corner points; compute axis-aligned rect
             xs = [p[0] for p in bbox]
             ys = [p[1] for p in bbox]
             rx1, ry1 = int(min(xs)), int(min(ys))
             rx2, ry2 = int(max(xs)), int(max(ys))
+            # Keep only the highest-confidence match when multiple runs match
             if best is None or conf > best["confidence"]:
                 best = {"x1": rx1, "y1": ry1, "x2": rx2, "y2": ry2,
                         "text": text, "confidence": conf}
@@ -89,12 +153,14 @@ def detect_by_ocr(
     if best is None:
         return None
 
+    # Expand bounding box to capture the icon to the left of the text
     w = best["x2"] - best["x1"]
     h = best["y2"] - best["y1"]
-    pad_v = int(h * v_padding_ratio)
+    pad_v    = int(h * v_padding_ratio)
     pad_left = int(w * expand_left_ratio)
 
     img_w, img_h = img.size
+    # Clamp so the box never exceeds image boundaries
     best["x1"] = max(0, best["x1"] - pad_left)
     best["y1"] = max(0, best["y1"] - pad_v)
     best["y2"] = min(img_h, best["y2"] + pad_v)
@@ -107,11 +173,20 @@ def detect_by_ocr(
 
 def autocrop_screenshot(img_bytes: bytes, tolerance: int = 30) -> bytes:
     """
-    Remove uniform solid-colour borders/padding from a screenshot.
-    Works by repeatedly checking whether the outermost row/column is
-    within `tolerance` of the image corner pixel colour.
-    Helps when the user pastes a screenshot that has desktop background
-    or application chrome around the actual logo.
+    Strip uniform solid-colour borders from a screenshot before template matching.
+
+    When a user captures a screenshot, it often includes desktop wallpaper,
+    window chrome, or application padding around the actual logo.  Those extra
+    pixels confuse template matching because they don't appear in the embedded
+    document image.
+
+    Algorithm:
+      1. Sample the top-left corner pixel as the assumed background colour.
+      2. Walk inward from each edge, removing rows/columns whose pixels are all
+         within `tolerance` (Euclidean per-channel difference) of that colour.
+      3. Return the cropped image, or the original if nothing was trimmed.
+
+    `tolerance=30` handles slight JPEG compression artefacts at the border.
     """
     import numpy as np
 
@@ -119,12 +194,14 @@ def autocrop_screenshot(img_bytes: bytes, tolerance: int = 30) -> bytes:
     arr  = np.array(img)
     h, w = arr.shape[:2]
 
-    # Sample the corner colour as the background guess
+    # Use top-left corner pixel as background colour reference
     bg = arr[0, 0].astype(int)
 
+    # Helper lambdas: True when every pixel in a row/col is within tolerance of bg
     def _is_border_row(row):  return np.all(np.abs(arr[row].astype(int) - bg) <= tolerance)
     def _is_border_col(col):  return np.all(np.abs(arr[:, col].astype(int) - bg) <= tolerance)
 
+    # Advance each edge inward until a non-background row/column is found
     top    = 0
     while top < h and _is_border_row(top):          top    += 1
     bottom = h - 1
@@ -134,7 +211,7 @@ def autocrop_screenshot(img_bytes: bytes, tolerance: int = 30) -> bytes:
     right  = w - 1
     while right > left and _is_border_col(right):   right  -= 1
 
-    if top >= bottom or left >= right:   # nothing to crop
+    if top >= bottom or left >= right:   # entire image was background — return as-is
         return img_bytes
 
     cropped = img.crop((left, top, right + 1, bottom + 1))
@@ -143,8 +220,17 @@ def autocrop_screenshot(img_bytes: bytes, tolerance: int = 30) -> bytes:
     return buf.getvalue()
 
 
-def _normalise_for_matching(gray_img):  # noqa: numpy ndarray → ndarray
-    """Apply CLAHE contrast normalisation so screenshots and embedded images match better."""
+def _normalise_for_matching(gray_img):
+    """
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalisation) to a
+    grayscale image before template matching.
+
+    CLAHE redistributes pixel intensities locally so that a screenshot taken
+    on a bright monitor matches an image embedded in a document at a different
+    brightness level.  `clipLimit=2.0` prevents over-amplification of noise,
+    and `tileGridSize=(8,8)` divides the image into 64 tiles for local
+    normalisation.
+    """
     import cv2
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray_img)
@@ -160,18 +246,40 @@ def detect_by_template(
     min_score: float = 0.45,
 ) -> dict | None:
     """
-    Multi-scale OpenCV template matching.
-    Automatically crops and normalises the template so screenshots
-    with padding/background work correctly.
-    Tries scales 40 %–160 % so size differences are handled.
-    Returns {"x1","y1","x2","y2","score"} or None.
+    Locate a logo inside an image using multi-scale OpenCV template matching.
+
+    Why multi-scale?
+    The logo in a document may be rendered at a different pixel size than the
+    screenshot the user uploads as a reference.  We try scales from 40 % to
+    160 % of the template dimensions (in 5 % steps) and keep the best match.
+
+    Pipeline:
+      1. Autocrop the user's screenshot to remove desktop padding.
+      2. Convert both images to grayscale and apply CLAHE normalisation so
+         brightness differences don't hurt matching quality.
+      3. At each scale, resize the template and run `cv2.matchTemplate` with
+         the TM_CCOEFF_NORMED metric (score 0–1, 1 = perfect match).
+      4. Return the best bounding box if its score exceeds `min_score`.
+
+    Parameters
+    ----------
+    img_bytes      : The full image to search within (e.g. a slide background).
+    template_bytes : The reference screenshot/crop of the logo.
+    min_score      : Minimum normalised correlation score to count as a match.
+                     0.45 works well for high-quality logos; lower values allow
+                     more tolerance for heavily compressed images.
+
+    Returns
+    -------
+    dict with x1, y1, x2, y2, score  — or None if no match above min_score.
     """
     import cv2
     import numpy as np
 
-    # Preprocess template: autocrop then normalise
+    # Remove padding/background from user screenshot before matching
     template_bytes = autocrop_screenshot(template_bytes)
 
+    # Convert both to normalised grayscale for invariance to colour/brightness
     img  = _normalise_for_matching(
         cv2.cvtColor(np.array(Image.open(BytesIO(img_bytes)).convert("RGB")),      cv2.COLOR_RGB2GRAY)
     )
@@ -183,11 +291,12 @@ def detect_by_template(
 
     best_score, best_loc, best_scale = -1.0, None, 1.0
 
+    # Iterate over scales 40 %–160 % in 5 % increments
     for scale in [s / 100 for s in range(40, 165, 5)]:
         new_w = max(1, int(tw * scale))
         new_h = max(1, int(th * scale))
         if new_w > iw or new_h > ih:
-            continue
+            continue   # scaled template larger than image — skip
         resized = cv2.resize(tmpl, (new_w, new_h), interpolation=cv2.INTER_AREA)
         res = cv2.matchTemplate(img, resized, cv2.TM_CCOEFF_NORMED)
         _, score, _, loc = cv2.minMaxLoc(res)
@@ -195,8 +304,9 @@ def detect_by_template(
             best_score, best_loc, best_scale = score, loc, scale
 
     if best_score < min_score or best_loc is None:
-        return None
+        return None   # no acceptable match found
 
+    # Convert best match back to pixel coordinates in the original image
     bw = int(tw * best_scale)
     bh = int(th * best_scale)
     x1, y1 = best_loc
@@ -213,19 +323,34 @@ def replace_region_in_image(
     new_logo_bytes: bytes,
 ) -> bytes:
     """
-    Paste `new_logo_bytes` (resized to the bbox dimensions) into `img_bytes`.
-    The background under the new logo is first cleared to the surrounding
-    average colour so there is no bleed-through from the old logo.
+    Paint the new logo over a specific rectangular region of an existing image.
+
+    Used when a logo is *baked into* a background image (not a standalone shape)
+    and cannot be replaced by swapping media files.  The detected bounding box
+    (from OCR or template matching) defines where to paint.
+
+    Steps:
+      1. Open the host image as RGBA.
+      2. Calculate the exact pixel dimensions of the bounding box.
+      3. Resize the new logo to exactly fit the bounding box (preserving aspect
+         ratio is intentionally NOT done here — the new logo fills the space
+         that the old logo occupied).
+      4. Fill the bounding box with opaque white first to erase any remnants of
+         the old logo before compositing the new one.
+      5. Alpha-composite the new logo on top.
+
+    Returns the modified image as a PNG byte-string.
     """
-    img     = Image.open(BytesIO(img_bytes)).convert("RGBA")
-    new_w   = max(1, x2 - x1)
-    new_h   = max(1, y2 - y1)
+    img      = Image.open(BytesIO(img_bytes)).convert("RGBA")
+    new_w    = max(1, x2 - x1)
+    new_h    = max(1, y2 - y1)
     new_logo = Image.open(BytesIO(new_logo_bytes)).convert("RGBA")
     new_logo = new_logo.resize((new_w, new_h), Image.LANCZOS)
 
-    # Clear old-logo area to white (or transparent) before pasting
+    # Erase the old logo area with solid white before pasting the new one
     clear = Image.new("RGBA", (new_w, new_h), (255, 255, 255, 255))
     img.paste(clear, (x1, y1))
+    # Composite new logo using its own alpha channel as the mask
     img.paste(new_logo, (x1, y1), new_logo)
 
     buf = BytesIO()
@@ -238,24 +363,50 @@ def replace_region_in_image(
 # ============================================================
 
 def _collect_pics(shapes):
+    """
+    Recursively collect all PICTURE shapes from a python-pptx shape tree.
+
+    Shapes can be nested inside GROUP shapes, so this recurses into any group.
+    Returns a flat list of all picture shape objects found at any depth.
+    """
     from pptx.enum.shapes import MSO_SHAPE_TYPE
     pics = []
     for shape in shapes:
         if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
             pics.append(shape)
         elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            # Recursively descend into group shapes
             pics.extend(_collect_pics(shape.shapes))
     return pics
 
 
 def extract_images_pptx(pptx_bytes: bytes) -> list[dict]:
     """
-    Scans ppt/media/* directly (gives zip_path), then uses python-pptx
-    to annotate where each image appears (master / layout / slide N).
+    Extract all unique media images from a PPTX file with their locations.
+
+    Two-phase approach:
+      Phase 1 — ZIP scan:  Read every file under `ppt/media/` directly from
+        the ZIP to get reliable zip_path values needed for later byte-swapping.
+        Images are de-duplicated by perceptual hash so the user sees each
+        unique logo only once even if it appears on multiple slides.
+
+      Phase 2 — python-pptx annotation:  Walk the slide master, layouts, and
+        individual slides to map each image hash back to human-readable
+        location names (e.g. "Slide Master", "Layout — Title Slide",
+        "Slide 3").
+
+    The result list is displayed in the Streamlit gallery for the user to
+    select which images are logos.
+
+    Returns a list of dicts with keys:
+      bytes     — raw image bytes
+      zip_path  — internal ZIP path used for replacement (e.g. ppt/media/image1.png)
+      locations — list of location strings
+      hash_str  — perceptual hash string (used as de-dup key)
     """
     from pptx import Presentation
 
-    # ── step 1: collect all media files with their zip paths ──
+    # ── Phase 1: collect all media files with their zip paths ──────────────
     media: dict[str, dict] = {}   # hash_str → entry
     with zipfile.ZipFile(BytesIO(pptx_bytes)) as z:
         for name in z.namelist():
@@ -263,7 +414,7 @@ def extract_images_pptx(pptx_bytes: bytes) -> list[dict]:
                 try:
                     data = z.read(name)
                     key  = str(get_image_hash(data))
-                    if key not in media:
+                    if key not in media:   # first occurrence wins for zip_path
                         media[key] = {
                             "bytes":    data,
                             "zip_path": name,
@@ -271,12 +422,13 @@ def extract_images_pptx(pptx_bytes: bytes) -> list[dict]:
                             "hash_str": key,
                         }
                 except Exception:
-                    pass
+                    pass  # skip corrupted or unreadable media entries
 
-    # ── step 2: annotate locations via python-pptx ──
+    # ── Phase 2: annotate with human-readable location names ───────────────
     prs = Presentation(BytesIO(pptx_bytes))
 
     def annotate(shapes, location: str):
+        """Add `location` to the media entry for every picture shape found."""
         for pic in _collect_pics(shapes):
             try:
                 key = str(get_image_hash(pic.image.blob))
@@ -291,7 +443,7 @@ def extract_images_pptx(pptx_bytes: bytes) -> list[dict]:
     for i, slide in enumerate(prs.slides):
         annotate(slide.shapes, f"Slide {i + 1}")
 
-    # Fill in location for any image not referenced via shapes
+    # Any media file not reachable through a shape gets a generic label
     for entry in media.values():
         if not entry["locations"]:
             entry["locations"].append("Media file (not linked to a shape)")
@@ -300,6 +452,16 @@ def extract_images_pptx(pptx_bytes: bytes) -> list[dict]:
 
 
 def extract_images_docx(docx_bytes: bytes) -> list[dict]:
+    """
+    Extract all unique embedded images from a DOCX file.
+
+    DOCX is also a ZIP archive; images live under `word/media/`.
+    De-duplicated by perceptual hash.  Location is reported generically as
+    "Document body" because DOCX doesn't expose per-paragraph image positions
+    through a simple API.
+
+    Returns the same dict schema as extract_images_pptx.
+    """
     seen: dict[str, dict] = {}
     with zipfile.ZipFile(BytesIO(docx_bytes)) as z:
         for name in z.namelist():
@@ -320,13 +482,24 @@ def extract_images_docx(docx_bytes: bytes) -> list[dict]:
 
 
 def extract_images_pdf(pdf_bytes: bytes) -> list[dict]:
+    """
+    Extract all unique embedded images from a PDF using PyMuPDF (fitz).
+
+    PDFs store images as XObjects referenced by an integer `xref`.  We iterate
+    every page's image list and de-duplicate by perceptual hash, accumulating
+    all page numbers where each image appears.  The `xref` is stored in the
+    dict so `embed_image_in_document` can call `doc.replace_image(xref, ...)`.
+
+    Returns the same dict schema as extract_images_pptx (using `xref` instead
+    of `zip_path`).
+    """
     import fitz
     seen: dict[str, dict] = {}
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         for page_num, page in enumerate(doc):
             for img_info in page.get_images(full=True):
-                xref = img_info[0]
+                xref = img_info[0]   # unique integer identifier for this image XObject
                 try:
                     data = doc.extract_image(xref)["image"]
                     key  = str(get_image_hash(data))
@@ -348,6 +521,10 @@ def extract_images_pdf(pdf_bytes: bytes) -> list[dict]:
 
 
 def extract_images_any(file_bytes: bytes, filename: str) -> list[dict]:
+    """
+    Route image extraction to the correct handler based on file extension.
+    Raises ValueError for unsupported formats.
+    """
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".pptx":
         return extract_images_pptx(file_bytes)
@@ -363,14 +540,28 @@ def extract_images_any(file_bytes: bytes, filename: str) -> list[dict]:
 # ============================================================
 
 def _zip_replace(zip_bytes: bytes, replacements: dict[str, bytes]) -> bytes:
-    """Replace specific paths inside a zip with new bytes."""
+    """
+    Rebuild a ZIP archive, substituting specific entries with new byte content.
+
+    This is the core primitive for safe PPTX/DOCX editing: rather than parsing
+    and re-serialising XML, we treat the Office file as a ZIP and swap only the
+    named entries.  Everything else — XML, relationships, themes, fonts — is
+    copied byte-for-byte, guaranteeing no accidental modifications.
+
+    Parameters
+    ----------
+    zip_bytes    : The original ZIP file bytes.
+    replacements : Mapping of {internal_zip_path: new_bytes}.
+    """
     buf = BytesIO()
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zin, \
          zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             if item.filename in replacements:
+                # Write the caller-supplied replacement bytes
                 zout.writestr(item.filename, replacements[item.filename])
             else:
+                # Copy unchanged entry verbatim
                 zout.writestr(item.filename, zin.read(item.filename))
     return buf.getvalue()
 
@@ -382,12 +573,18 @@ def embed_image_in_document(
     new_img_bytes: bytes,
 ) -> bytes:
     """
-    Put a (possibly region-modified) image back into the document.
-    Uses zip_path for pptx/docx, xref for pdf.
+    Re-embed a (possibly region-modified) image back into its parent document.
+
+    For PPTX/DOCX: delegates to `_zip_replace` using `img_meta["zip_path"]`.
+    For PDF:       uses PyMuPDF's `replace_image(xref, ...)` API.
+
+    Called by the region-detection flow after `replace_region_in_image` has
+    painted the new logo over the detected bounding box.
     """
     ext = os.path.splitext(filename.lower())[1]
 
     if ext in (".pptx", ".docx", ".doc"):
+        # Swap only the specific media file; all XML left untouched
         return _zip_replace(file_bytes, {img_meta["zip_path"]: new_img_bytes})
 
     if ext == ".pdf":
@@ -395,6 +592,7 @@ def embed_image_in_document(
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         try:
             doc.replace_image(img_meta["xref"], stream=new_img_bytes)
+            # garbage=4 removes all orphaned objects; deflate=True recompresses
             return doc.tobytes(garbage=4, deflate=True)
         finally:
             doc.close()
@@ -411,9 +609,19 @@ def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
     Replace matching logos in a PPTX by swapping image bytes directly inside
     the ZIP (ppt/media/*).  The slide/master/layout XML is never touched, so
     all shapes, graphics, z-order, animations and formatting stay intact.
+
+    How matching works:
+      Each media file's perceptual hash is compared to the old logo's hash.
+      If the Hamming distance is ≤ threshold, the bytes are replaced with the
+      new logo (converted to PNG for consistency).
+
+    Why not use python-pptx to remove/re-add the shape?
+      Removing and re-inserting a shape via python-pptx changes the XML
+      structure, resets z-order, and can corrupt master/layout relationships.
+      Direct ZIP byte-swapping avoids all of that.
     """
     old_hash = get_image_hash(old_logo_bytes)
-    new_png  = to_png(new_logo_bytes)
+    new_png  = to_png(new_logo_bytes)   # normalise to RGBA PNG
     buf, count = BytesIO(), 0
     with zipfile.ZipFile(BytesIO(pptx_bytes)) as zin, \
          zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -422,16 +630,22 @@ def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
             if item.filename.lower().startswith("ppt/media/"):
                 try:
                     if old_hash - get_image_hash(data) <= threshold:
+                        # Hash distance within tolerance → this is the target logo
                         zout.writestr(item.filename, new_png)
                         count += 1
                         continue
                 except Exception:
                     pass
+            # All other entries (XML, relationships, themes…) copied unchanged
             zout.writestr(item.filename, data)
     return buf.getvalue(), count
 
 
 def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
+    """
+    Replace matching logos in a DOCX by swapping bytes inside the ZIP
+    (`word/media/*`).  Same hash-based strategy as replace_logo_pptx.
+    """
     old_hash = get_image_hash(old_logo_bytes)
     new_png  = to_png(new_logo_bytes)
     buf, count = BytesIO(), 0
@@ -453,23 +667,41 @@ def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
 
 def _to_pdf_safe_png(img_bytes: bytes) -> bytes:
     """
-    Convert image bytes to an RGB PNG with no alpha channel.
-    PDFs don't support RGBA natively (alpha needs a separate SMask object
-    that PyMuPDF's replace_image doesn't auto-create), so we composite
-    any transparency onto a white background first.
+    Convert image bytes to an RGB PNG with no alpha channel, safe for PDFs.
+
+    PDFs represent transparency via a separate /SMask (soft-mask) XObject.
+    PyMuPDF's `replace_image` does not auto-create an SMask when given an RGBA
+    PNG, causing the 4th (alpha) byte to be misinterpreted as a colour channel
+    and producing a corrupted image in the output PDF.
+
+    Fix: alpha-composite the new logo onto an opaque white background and
+    save as a standard RGB PNG.  Logos that were already opaque are unaffected;
+    logos with transparency get a clean white fill, which is the right default
+    for document backgrounds.
     """
     img = Image.open(BytesIO(img_bytes)).convert("RGBA")
     bg  = Image.new("RGB", img.size, (255, 255, 255))
-    bg.paste(img, mask=img.split()[3])   # alpha-composite onto white
+    bg.paste(img, mask=img.split()[3])   # alpha-composite RGBA onto white RGB
     buf = BytesIO()
     bg.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
+    """
+    Replace matching logos in a PDF using PyMuPDF's replace_image API.
+
+    Iterates every image XObject across all pages (de-duped by xref so shared
+    images are only replaced once).  Matching is done by perceptual hash.
+    The replacement image is converted to a PDF-safe RGB PNG via
+    `_to_pdf_safe_png` to avoid alpha-channel corruption.
+
+    `doc.tobytes(garbage=4, deflate=True)` rebuilds the PDF with all orphaned
+    objects removed (garbage=4) and streams recompressed (deflate=True).
+    """
     import fitz
     old_hash    = get_image_hash(old_logo_bytes)
-    new_pdf_png = _to_pdf_safe_png(new_logo_bytes)   # RGB PNG, no alpha
+    new_pdf_png = _to_pdf_safe_png(new_logo_bytes)   # RGB PNG — no alpha channel
     count, done = 0, set()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -477,7 +709,7 @@ def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
             for img_info in page.get_images(full=True):
                 xref = img_info[0]
                 if xref in done:
-                    continue
+                    continue   # already replaced in a previous page reference
                 try:
                     data = doc.extract_image(xref)["image"]
                     if old_hash - get_image_hash(data) <= threshold:
@@ -492,6 +724,7 @@ def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
 
 
 def replace_logo_any(file_bytes, filename, old_logo_bytes, new_logo_bytes, threshold):
+    """Dispatch logo replacement to the correct format handler."""
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".pptx":
         return replace_logo_pptx(file_bytes, old_logo_bytes, new_logo_bytes, threshold)
@@ -510,10 +743,14 @@ def replace_multiple_logos_any(
     threshold: int = 8,
 ) -> tuple[bytes, int]:
     """
-    Replace all logos in `old_logos_bytes` inside a single document in one go.
-    Iterates through each reference logo and applies hash-based replacement in turn,
-    accumulating changes so the output contains all replacements.
-    Returns (updated_file_bytes, total_replacements).
+    Replace every logo in `old_logos_bytes` inside a single document in one pass.
+
+    Applies `replace_logo_any` sequentially for each reference logo image,
+    feeding the output of one replacement as the input to the next.  This
+    allows multiple distinct logos (e.g. header + footer logo) to all be
+    replaced in a single call that returns one combined output file.
+
+    Returns (updated_file_bytes, total_replacement_count).
     """
     data  = file_bytes
     total = 0
@@ -529,50 +766,94 @@ def replace_multiple_logos_any(
 
 def _replace_text_in_xml(xml_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
     """
-    Replace text in a single PPTX/DOCX XML part, handling text that may be
-    split across multiple <a:r> or <w:r> run elements within a paragraph.
-    Only modifies <a:t>/<w:t> text nodes; all other XML is untouched.
-    Returns (modified_bytes, replacement_count).
+    Find and replace text within a single PPTX/DOCX XML part, correctly
+    handling cases where PowerPoint/Word has split the target string across
+    multiple text run elements (`<a:r>` / `<w:r>`).
+
+    Why split runs are a problem:
+      Office applications frequently store a single visible string as multiple
+      XML runs for formatting or editing-history reasons.  A string like
+      "LTIMindtree" might exist in the XML as three separate <a:t> nodes:
+      "LTI", "Mind", "tree".  A naïve `.replace()` on raw XML bytes would
+      miss this entirely.
+
+    How this function handles it:
+      1. Parse the XML with lxml.
+      2. For each paragraph (`<a:p>` or `<w:p>`), gather all text-run elements
+         (`<a:r>` / `<w:r>`) and their text nodes (`<a:t>` / `<w:t>`).
+      3. Concatenate all text nodes into a single string.
+      4. If the target string is present in the concatenation, replace it there,
+         write the result into the *first* text node, and clear the remaining
+         nodes.  This preserves the formatting properties (<a:rPr>/<w:rPr>) of
+         the first run while eliminating fragment artefacts.
+      5. Set `xml:space="preserve"` when the result has leading/trailing spaces
+         to prevent XML parsers from stripping them.
+
+    Only `<a:t>` / `<w:t>` text content is ever modified; all other XML
+    (properties, relationships, namespaces) is left completely unchanged.
+
+    Returns (modified_xml_bytes, replacement_count).
+    If no match is found the original bytes are returned unchanged (count=0).
     """
     from lxml import etree
+    # DrawingML namespace (PPTX text)
     _A     = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    # WordprocessingML namespace (DOCX text)
     _W     = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    # xml:space attribute used to preserve leading/trailing whitespace
     _SPACE = "{http://www.w3.org/XML/1998/namespace}space"
     count  = 0
 
     try:
         root = etree.fromstring(xml_bytes)
     except Exception:
-        return xml_bytes, 0
+        return xml_bytes, 0   # unparseable XML — return untouched
 
+    # Process both DrawingML (PPTX) and WordprocessingML (DOCX) paragraph types
     for p_tag, r_tag, t_tag in [
-        (f"{{{_A}}}p", f"{{{_A}}}r", f"{{{_A}}}t"),
-        (f"{{{_W}}}p", f"{{{_W}}}r", f"{{{_W}}}t"),
+        (f"{{{_A}}}p", f"{{{_A}}}r", f"{{{_A}}}t"),   # PPTX
+        (f"{{{_W}}}p", f"{{{_W}}}r", f"{{{_W}}}t"),   # DOCX
     ]:
         for para in root.iter(p_tag):
             runs   = para.findall(r_tag)
+            # Collect only those runs that have a text element
             telems = [r.find(t_tag) for r in runs]
             telems = [t for t in telems if t is not None]
             if not telems:
                 continue
+            # Concatenate all run texts to get the full visible string
             full = "".join(t.text or "" for t in telems)
             if old_text not in full:
                 continue
+            # Perform the replacement on the concatenated string
             new_full = full.replace(old_text, new_text)
             count   += full.count(old_text)
+            # Write entire result into first run's text node
             telems[0].text = new_full
+            # Preserve leading/trailing spaces if present
             if new_full != new_full.strip():
                 telems[0].set(_SPACE, "preserve")
+            # Clear the remaining fragment text nodes (their runs still exist
+            # with their rPr but contribute no visible text)
             for t in telems[1:]:
                 t.text = ""
 
     if count == 0:
         return xml_bytes, 0
+    # Re-serialise with XML declaration to maintain byte-level compatibility
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), count
 
 
 def replace_text_pptx(pptx_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
-    """Replace text across all slides, masters, layouts and notes in a PPTX."""
+    """
+    Replace text across all XML parts of a PPTX that can contain visible text:
+    slides, slide layouts, slide masters, notes slides, handout masters, and
+    notes masters.
+
+    Non-XML entries (media files, theme files, font embeds, rels) are copied
+    byte-for-byte.  Returns (updated_pptx_bytes, total_replacement_count).
+    """
+    # All ZIP directories that contain XML with visible text content
     XML_DIRS = (
         "ppt/slides/", "ppt/slidelayouts/", "ppt/slidemasters/",
         "ppt/notesslides/", "ppt/handoutmasters/", "ppt/notesmasters/",
@@ -594,7 +875,13 @@ def replace_text_pptx(pptx_bytes: bytes, old_text: str, new_text: str) -> tuple[
 
 
 def replace_text_docx(docx_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
-    """Replace text across all XML parts in a DOCX."""
+    """
+    Replace text across all XML parts in a DOCX.
+
+    Processes every `.xml` file in the archive (document body, headers,
+    footers, footnotes, endnotes, etc.).  Non-XML entries are copied unchanged.
+    Returns (updated_docx_bytes, total_replacement_count).
+    """
     total = 0
     buf   = BytesIO()
     with zipfile.ZipFile(BytesIO(docx_bytes)) as zin, \
@@ -611,6 +898,7 @@ def replace_text_docx(docx_bytes: bytes, old_text: str, new_text: str) -> tuple[
 
 
 def replace_text_any(file_bytes: bytes, filename: str, old_text: str, new_text: str) -> tuple[bytes, int]:
+    """Dispatch text replacement to the correct format handler."""
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".pptx":
         return replace_text_pptx(file_bytes, old_text, new_text)
@@ -620,7 +908,15 @@ def replace_text_any(file_bytes: bytes, filename: str, old_text: str, new_text: 
 
 
 def process_zip(zip_bytes, old_logo_bytes, new_logo_bytes, threshold):
-    """Hash-based whole-image replacement across all files in a ZIP."""
+    """
+    Apply hash-based whole-image logo replacement to every supported document
+    in a ZIP archive in a single pass.
+
+    Iterates all entries; for PPTX/DOCX/PDF files calls `replace_logo_any`,
+    all other files (images, fonts, other ZIPs) are copied unchanged.
+
+    Returns (output_zip_bytes, total_replacements, files_processed).
+    """
     buf, total, files = BytesIO(), 0, 0
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zin, \
          zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -647,16 +943,25 @@ def process_zip_region(
     progress_cb=None,   # optional callable(msg: str) for live status updates
 ) -> tuple[bytes, int, int, int]:
     """
-    Fully automated region-replacement across every supported document in a ZIP.
+    Automated region-based logo replacement across every supported document in a ZIP.
 
-    For each file:
-      1. Extract all embedded images.
-      2. Run detect_fn on each image.
-      3. For every image where a region is found, paint the new logo over it
-         and re-embed it back into that document.
-      4. If multiple distinct images in the same file all match, all are handled.
+    This handles the hard case where a logo is *baked into* a background image
+    rather than existing as a standalone picture shape.  For each embedded image
+    in each document, a detection function (OCR or template match) is run to
+    locate the logo bbox, then `replace_region_in_image` paints the new logo
+    over that region, and `embed_image_in_document` writes it back.
 
-    Returns (output_zip_bytes, files_processed, regions_replaced, files_with_no_match).
+    Parameters
+    ----------
+    zip_outer_bytes : Raw bytes of the outer ZIP file.
+    detect_fn       : Callable receiving image bytes, returning a bbox dict
+                      {x1, y1, x2, y2} or None if not found.
+    new_logo_bytes  : The new logo to paint into each detected region.
+    progress_cb     : Optional callback for real-time progress messages in the UI.
+
+    Returns
+    -------
+    (output_zip_bytes, files_processed, regions_replaced, files_with_no_match)
     """
     DOC_EXTS = {".pptx", ".docx", ".doc", ".pdf"}
     out_buf          = BytesIO()
@@ -692,19 +997,20 @@ def process_zip_region(
                         bbox = None
 
                     if bbox is None:
-                        continue
+                        continue   # logo not found in this image
 
-                    modified_img       = replace_region_in_image(
+                    # Paint new logo over the detected bounding box
+                    modified_img = replace_region_in_image(
                         img_meta["bytes"],
                         bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"],
                         new_logo_bytes,
                     )
-                    img_meta["bytes"]  = modified_img   # update for chained calls
-                    file_data          = embed_image_in_document(
+                    img_meta["bytes"] = modified_img   # update meta for chained detection
+                    file_data = embed_image_in_document(
                         file_data, item.filename, img_meta, modified_img
                     )
-                    found_in_file     += 1
-                    regions_replaced  += 1
+                    found_in_file    += 1
+                    regions_replaced += 1
 
                 if found_in_file == 0:
                     files_no_match += 1
@@ -723,7 +1029,7 @@ def process_zip_region(
             except Exception as e:
                 if progress_cb:
                     progress_cb(f"  ↳ ERROR on {os.path.basename(item.filename)}: {e}")
-                zout.writestr(item.filename, data)   # pass through unchanged
+                zout.writestr(item.filename, data)   # pass through unchanged on error
 
     return out_buf.getvalue(), files_processed, regions_replaced, files_no_match
 
@@ -736,14 +1042,28 @@ def process_zip_by_refs(
     progress_cb=None,
 ) -> tuple[bytes, int, int]:
     """
-    Replace every embedded image across all documents in a ZIP that perceptually
-    matches ANY of the supplied reference images.
+    Replace logos across all documents in a ZIP using pre-selected reference images.
 
-    ref_images  – list of raw image bytes extracted from the user-selected logos
-    threshold   – max pHash distance to count as a match (0=exact, 20=very loose)
+    This is the "Guided" ZIP flow.  The user first scans one sample file to see
+    its embedded images, selects which ones are logos, and those image bytes
+    become `ref_images`.  Every document in the ZIP is then processed: any
+    embedded image whose pHash is within `threshold` of any reference hash is
+    replaced with the new logo.
 
-    Returns (out_zip_bytes, files_processed, total_replacements).
+    Parameters
+    ----------
+    zip_bytes   : Raw bytes of the ZIP archive.
+    ref_images  : List of raw bytes for each reference logo the user selected.
+    new_logo_bytes : The new logo bytes to embed.
+    threshold   : Maximum pHash Hamming distance to count as a match (0–20).
+                  0 = exact match only.  8 = tolerates minor compression changes.
+    progress_cb : Optional callback for live log output in the UI.
+
+    Returns
+    -------
+    (output_zip_bytes, files_processed, total_replacements)
     """
+    # Pre-compute hashes of all reference logos once for efficiency
     ref_hashes = [get_image_hash(b) for b in ref_images]
     out_buf      = BytesIO()
     files_proc   = 0
@@ -777,6 +1097,7 @@ def process_zip_by_refs(
                     except Exception:
                         continue
 
+                    # Check if this image matches any user-selected reference logo
                     if any(abs(h - rh) <= threshold for rh in ref_hashes):
                         file_data = embed_image_in_document(
                             file_data, item.filename, img_meta,
@@ -805,19 +1126,25 @@ def process_zip_by_refs(
 # ============================================================
 # SESSION STATE
 # ============================================================
+# Streamlit reruns the entire script on every user interaction.
+# `st.session_state` is a dict-like object that persists across reruns,
+# allowing us to remember which file is loaded, which images were scanned,
+# and which logos the user has selected.
+# ============================================================
 
 _defaults = {
-    "images":          [],
-    "selected":        None,
-    "doc_cache":       None,
-    "bbox":            None,    # detected region dict for intra-image mode
-    "drill_active":    False,   # whether the "Find inside image" panel is open
+    "images":          [],      # list of image-meta dicts from the last scan
+    "selected":        None,    # index of the image currently open in the Inspect panel
+    "doc_cache":       None,    # tuple (filename, bytes) — avoids re-reading on every rerun
+    "bbox":            None,    # detected region dict {x1,y1,x2,y2} for intra-image mode
+    "drill_active":    False,   # whether the "Find inside image" drill-down panel is open
     # ZIP guided flow
-    "zip_sample_imgs": [],      # images scanned from the chosen sample file
-    "zip_ref_indices": [],      # indices of logo images selected by the user
+    "zip_sample_imgs": [],      # image-meta dicts scanned from the chosen sample file
+    "zip_ref_indices": [],      # list of indices into zip_sample_imgs selected by the user
     # single-file multi-select
-    "selected_set":    set(),   # indices of logo images marked for bulk replacement
+    "selected_set":    set(),   # set of indices of images marked for bulk replacement
 }
+# Initialise any missing keys without overwriting values already in state
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -827,6 +1154,7 @@ for _k, _v in _defaults.items():
 # UI HELPERS
 # ============================================================
 
+# Maps file extensions to their official MIME types for the browser download
 MIME = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -836,6 +1164,11 @@ MIME = {
 
 
 def _download_doc(label: str, data: bytes, stem: str, ext: str):
+    """
+    Render a Streamlit download button for an updated document.
+    The output filename appends `_updated` to the original stem to avoid
+    overwriting the source file accidentally.
+    """
     st.download_button(
         label, data,
         file_name=f"{stem}_updated{ext}",
@@ -863,13 +1196,17 @@ doc_file = st.file_uploader(
     type=["pptx", "docx", "doc", "pdf", "zip"],
     help="Single file or a ZIP containing multiple documents.",
 )
+# Detect whether the uploaded file is a ZIP batch
 is_zip = doc_file is not None and doc_file.name.lower().endswith(".zip")
 
 if doc_file:
     cache = st.session_state.doc_cache
+    # Only re-read file bytes when a *different* file is uploaded;
+    # on subsequent reruns (e.g. button clicks) the cached bytes are reused
     if cache is None or cache[0] != doc_file.name:
         doc_file.seek(0)
         st.session_state.doc_cache        = (doc_file.name, doc_file.read())
+        # Reset all scan/selection state for the new file
         st.session_state.images           = []
         st.session_state.selected         = None
         st.session_state.selected_set     = set()
