@@ -46,6 +46,30 @@ def to_png(img_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+def shrink_logo(img_bytes: bytes, ratio: float = 0.54) -> bytes:
+    """
+    Resize a logo to `ratio` of its original dimensions (default 54% = 46% reduction)
+    and return the result as an RGBA PNG.
+
+    The resized logo is centred on a transparent canvas the same size as the
+    original so that the bounding-box slot in the document is filled correctly
+    and the surrounding area remains transparent (for PPTX/DOCX) or white (for PDF).
+    """
+    img = Image.open(BytesIO(img_bytes)).convert("RGBA")
+    orig_w, orig_h = img.size
+    new_w = max(1, int(orig_w * ratio))
+    new_h = max(1, int(orig_h * ratio))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    # Place the smaller logo centred on a transparent canvas of the original size
+    canvas = Image.new("RGBA", (orig_w, orig_h), (0, 0, 0, 0))
+    offset_x = (orig_w - new_w) // 2
+    offset_y = (orig_h - new_h) // 2
+    canvas.paste(resized, (offset_x, offset_y), resized)
+    buf = BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def thumbnail_bytes(img_bytes: bytes, size: tuple = (220, 220)) -> bytes:
     """
     Create a small RGBA thumbnail for gallery display in the Streamlit UI.
@@ -621,7 +645,7 @@ def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
       Direct ZIP byte-swapping avoids all of that.
     """
     old_hash = get_image_hash(old_logo_bytes)
-    new_png  = to_png(new_logo_bytes)   # normalise to RGBA PNG
+    new_png  = shrink_logo(new_logo_bytes)   # resize to 54% then normalise to RGBA PNG
     buf, count = BytesIO(), 0
     with zipfile.ZipFile(BytesIO(pptx_bytes)) as zin, \
          zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -647,7 +671,7 @@ def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
     (`word/media/*`).  Same hash-based strategy as replace_logo_pptx.
     """
     old_hash = get_image_hash(old_logo_bytes)
-    new_png  = to_png(new_logo_bytes)
+    new_png  = shrink_logo(new_logo_bytes)   # resize to 54% then normalise to RGBA PNG
     buf, count = BytesIO(), 0
     with zipfile.ZipFile(BytesIO(docx_bytes)) as zin, \
          zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -701,7 +725,7 @@ def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
     """
     import fitz
     old_hash    = get_image_hash(old_logo_bytes)
-    new_pdf_png = _to_pdf_safe_png(new_logo_bytes)   # RGB PNG — no alpha channel
+    new_pdf_png = _to_pdf_safe_png(shrink_logo(new_logo_bytes))   # shrink then convert to RGB PNG
     count, done = 0, set()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -764,37 +788,38 @@ def replace_multiple_logos_any(
 # TEXT REPLACEMENT  (handles split runs across a:r / w:r)
 # ============================================================
 
-def _replace_text_in_xml(xml_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
+def _replace_text_in_xml(
+    xml_bytes: bytes,
+    old_text: str,
+    new_text: str,
+    extra_pairs: list[tuple[str, str]] | None = None,
+) -> tuple[bytes, int]:
     """
     Find and replace text within a single PPTX/DOCX XML part, correctly
     handling cases where PowerPoint/Word has split the target string across
     multiple text run elements (`<a:r>` / `<w:r>`).
 
-    Why split runs are a problem:
-      Office applications frequently store a single visible string as multiple
-      XML runs for formatting or editing-history reasons.  A string like
-      "LTIMindtree" might exist in the XML as three separate <a:t> nodes:
-      "LTI", "Mind", "tree".  A naïve `.replace()` on raw XML bytes would
-      miss this entirely.
+    Parameters
+    ----------
+    xml_bytes    : Raw bytes of the XML part.
+    old_text     : Primary string to search for.
+    new_text     : Replacement for old_text.
+    extra_pairs  : Additional (old, new) string pairs applied after the primary
+                   replacement (e.g. for year normalisation).  Each pair is
+                   applied as a plain string replacement on the already-combined
+                   paragraph text.
 
-    How this function handles it:
-      1. Parse the XML with lxml.
-      2. For each paragraph (`<a:p>` or `<w:p>`), gather all text-run elements
-         (`<a:r>` / `<w:r>`) and their text nodes (`<a:t>` / `<w:t>`).
-      3. Concatenate all text nodes into a single string.
-      4. If the target string is present in the concatenation, replace it there,
-         write the result into the *first* text node, and clear the remaining
-         nodes.  This preserves the formatting properties (<a:rPr>/<w:rPr>) of
-         the first run while eliminating fragment artefacts.
-      5. Set `xml:space="preserve"` when the result has leading/trailing spaces
-         to prevent XML parsers from stripping them.
-
-    Only `<a:t>` / `<w:t>` text content is ever modified; all other XML
-    (properties, relationships, namespaces) is left completely unchanged.
+    How split runs are handled:
+      Office stores visible strings across multiple <a:r>/<w:r> run elements.
+      Each paragraph's run texts are concatenated, the replacement is applied
+      to the combined string, the result is written into the first run's text
+      node, and remaining run text nodes are cleared.  All formatting properties
+      (<a:rPr>/<w:rPr>) are preserved.
 
     Returns (modified_xml_bytes, replacement_count).
-    If no match is found the original bytes are returned unchanged (count=0).
+    If no changes are made the original bytes are returned (count=0).
     """
+    import re
     from lxml import etree
     # DrawingML namespace (PPTX text)
     _A     = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -823,18 +848,29 @@ def _replace_text_in_xml(xml_bytes: bytes, old_text: str, new_text: str) -> tupl
                 continue
             # Concatenate all run texts to get the full visible string
             full = "".join(t.text or "" for t in telems)
-            if old_text not in full:
-                continue
-            # Perform the replacement on the concatenated string
-            new_full = full.replace(old_text, new_text)
-            count   += full.count(old_text)
+            original_full = full
+
+            # Apply the primary replacement
+            if old_text in full:
+                full   = full.replace(old_text, new_text)
+                count += original_full.count(old_text)
+
+            # Apply any extra (old, new) pairs — e.g. year normalisation
+            if extra_pairs:
+                for ep_old, ep_new in extra_pairs:
+                    if ep_old in full:
+                        full   = full.replace(ep_old, ep_new)
+                        count += 1
+
+            if full == original_full:
+                continue   # nothing changed in this paragraph
+
             # Write entire result into first run's text node
-            telems[0].text = new_full
+            telems[0].text = full
             # Preserve leading/trailing spaces if present
-            if new_full != new_full.strip():
+            if full != full.strip():
                 telems[0].set(_SPACE, "preserve")
-            # Clear the remaining fragment text nodes (their runs still exist
-            # with their rPr but contribute no visible text)
+            # Clear the remaining fragment text nodes
             for t in telems[1:]:
                 t.text = ""
 
@@ -844,7 +880,39 @@ def _replace_text_in_xml(xml_bytes: bytes, old_text: str, new_text: str) -> tupl
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True), count
 
 
-def replace_text_pptx(pptx_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
+def _build_year_pairs(new_text: str, target_year: str = "2026") -> list[tuple[str, str]]:
+    """
+    Build extra (old, new) replacement pairs so that any 4-digit year that
+    follows a known suffix in `new_text` is updated to `target_year`.
+
+    For example if new_text ends with "LTM | Privileged and Confidential",
+    this returns pairs like:
+        ("LTM | Privileged and Confidential 2021", "LTM | Privileged and Confidential 2026")
+        ("LTM | Privileged and Confidential 2022", "LTM | Privileged and Confidential 2026")
+        ... up to the year before target_year
+
+    We also cover the *old* branding string so the year gets updated regardless
+    of whether the primary text replacement fires first or not in the same para.
+    """
+    import re
+    pairs: list[tuple[str, str]] = []
+    suffixes = [new_text]  # catch year on already-replaced new text
+    for year in range(2018, int(target_year)):   # 2018–2025 covers realistic range
+        yr = str(year)
+        for sfx in suffixes:
+            candidate_old = f"{sfx} {yr}"
+            candidate_new = f"{sfx} {target_year}"
+            if candidate_old != candidate_new:
+                pairs.append((candidate_old, candidate_new))
+    return pairs
+
+
+def replace_text_pptx(
+    pptx_bytes: bytes,
+    old_text: str,
+    new_text: str,
+    extra_pairs: list[tuple[str, str]] | None = None,
+) -> tuple[bytes, int]:
     """
     Replace text across all XML parts of a PPTX that can contain visible text:
     slides, slide layouts, slide masters, notes slides, handout masters, and
@@ -866,7 +934,7 @@ def replace_text_pptx(pptx_bytes: bytes, old_text: str, new_text: str) -> tuple[
             data  = zin.read(item.filename)
             fname = item.filename.lower()
             if fname.endswith(".xml") and any(fname.startswith(d) for d in XML_DIRS):
-                modified, n = _replace_text_in_xml(data, old_text, new_text)
+                modified, n = _replace_text_in_xml(data, old_text, new_text, extra_pairs)
                 if n:
                     data   = modified
                     total += n
@@ -874,7 +942,12 @@ def replace_text_pptx(pptx_bytes: bytes, old_text: str, new_text: str) -> tuple[
     return buf.getvalue(), total
 
 
-def replace_text_docx(docx_bytes: bytes, old_text: str, new_text: str) -> tuple[bytes, int]:
+def replace_text_docx(
+    docx_bytes: bytes,
+    old_text: str,
+    new_text: str,
+    extra_pairs: list[tuple[str, str]] | None = None,
+) -> tuple[bytes, int]:
     """
     Replace text across all XML parts in a DOCX.
 
@@ -889,7 +962,7 @@ def replace_text_docx(docx_bytes: bytes, old_text: str, new_text: str) -> tuple[
         for item in zin.infolist():
             data = zin.read(item.filename)
             if item.filename.lower().endswith(".xml"):
-                modified, n = _replace_text_in_xml(data, old_text, new_text)
+                modified, n = _replace_text_in_xml(data, old_text, new_text, extra_pairs)
                 if n:
                     data   = modified
                     total += n
@@ -897,13 +970,27 @@ def replace_text_docx(docx_bytes: bytes, old_text: str, new_text: str) -> tuple[
     return buf.getvalue(), total
 
 
-def replace_text_any(file_bytes: bytes, filename: str, old_text: str, new_text: str) -> tuple[bytes, int]:
-    """Dispatch text replacement to the correct format handler."""
+def replace_text_any(
+    file_bytes: bytes,
+    filename: str,
+    old_text: str,
+    new_text: str,
+    update_year: bool = True,
+    target_year: str = "2026",
+) -> tuple[bytes, int]:
+    """
+    Dispatch text replacement to the correct format handler.
+
+    When `update_year=True` (default), also replaces any occurrence of
+    `new_text + " YYYY"` (for years 2018–2025) with `new_text + " 2026"`
+    so that the copyright/confidentiality year is normalised in the same pass.
+    """
+    extra_pairs = _build_year_pairs(new_text, target_year) if update_year else None
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".pptx":
-        return replace_text_pptx(file_bytes, old_text, new_text)
+        return replace_text_pptx(file_bytes, old_text, new_text, extra_pairs)
     if ext in (".docx", ".doc"):
-        return replace_text_docx(file_bytes, old_text, new_text)
+        return replace_text_docx(file_bytes, old_text, new_text, extra_pairs)
     raise ValueError(f"Text replacement not supported for {ext}")
 
 
