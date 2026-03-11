@@ -8,6 +8,7 @@
 # =============================================================================
 
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -16,6 +17,11 @@ from io import BytesIO
 import imagehash          # perceptual image hashing (pHash) for visual similarity
 import streamlit as st
 from PIL import Image, ImageDraw   # image manipulation and annotation
+
+# Case-insensitive pattern that matches every capitalisation variant of the
+# brand name the user wants to rename (e.g. LTIMindtree / LTIMINDTREE /
+# ltimindtree / Ltimindtree / LTIMINDTree …).
+_LTIMINDTREE_RE = re.compile(r"LTIMindtree", re.IGNORECASE)
 
 
 # ============================================================
@@ -628,6 +634,55 @@ def embed_image_in_document(
 # STANDARD HASH-BASED FULL-IMAGE REPLACEMENT (existing flow)
 # ============================================================
 
+def _apply_branding_rename_zip(zip_bytes: bytes) -> bytes:
+    """
+    Walk every XML file in a PPTX/DOCX ZIP archive and rename any
+    capitalisation of "LTIMindtree" to "LTM".  Handles split runs the same
+    way as `_replace_text_in_xml` (called with no old/new_text so only the
+    always-on LTIMindtree pass fires).  Non-XML entries are copied unchanged.
+    """
+    buf = BytesIO()
+    with zipfile.ZipFile(BytesIO(zip_bytes)) as zin, \
+         zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.lower().endswith(".xml"):
+                modified, n = _replace_text_in_xml(data)   # LTIMindtree-only pass
+                if n:
+                    data = modified
+            zout.writestr(item.filename, data)
+    return buf.getvalue()
+
+
+def _apply_branding_rename_pdf(pdf_bytes: bytes) -> bytes:
+    """
+    Search every page of a PDF for visible text matching "LTIMindtree" in any
+    capitalisation and redact it, inserting "LTM" in its place.
+
+    Uses PyMuPDF's redaction annotation API:  the matched rectangle is whited
+    out and the replacement string is drawn at the same position.  Font and
+    size may not exactly match the original — this is an inherent limitation
+    of PDF text editing without embedded font metrics.
+    """
+    import fitz
+    # Enumerate the casing variants that the user explicitly mentioned plus
+    # all-caps and sentence-case to cover common possibilities.
+    _VARIANTS = ["LTIMindtree", "LTIMINDTREE", "ltimindtree", "Ltimindtree"]
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for page in doc:
+            found_any = False
+            for variant in _VARIANTS:
+                for rect in page.search_for(variant):
+                    page.add_redact_annot(rect, text="LTM")
+                    found_any = True
+            if found_any:
+                page.apply_redactions()
+        return doc.tobytes(garbage=4, deflate=True)
+    finally:
+        doc.close()
+
+
 def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
     """
     Replace matching logos in a PPTX by swapping image bytes directly inside
@@ -662,7 +717,8 @@ def replace_logo_pptx(pptx_bytes, old_logo_bytes, new_logo_bytes, threshold):
                     pass
             # All other entries (XML, relationships, themes…) copied unchanged
             zout.writestr(item.filename, data)
-    return buf.getvalue(), count
+    # Also rename LTIMindtree → LTM in all slide/master XML text
+    return _apply_branding_rename_zip(buf.getvalue()), count
 
 
 def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
@@ -686,7 +742,8 @@ def replace_logo_docx(docx_bytes, old_logo_bytes, new_logo_bytes, threshold):
                 except Exception:
                     pass
             zout.writestr(item.filename, data)
-    return buf.getvalue(), count
+    # Also rename LTIMindtree → LTM in all XML text
+    return _apply_branding_rename_zip(buf.getvalue()), count
 
 
 def _to_pdf_safe_png(img_bytes: bytes) -> bytes:
@@ -742,7 +799,8 @@ def replace_logo_pdf(pdf_bytes, old_logo_bytes, new_logo_bytes, threshold):
                         count += 1
                 except Exception:
                     pass
-        return doc.tobytes(garbage=4, deflate=True), count
+        result = doc.tobytes(garbage=4, deflate=True)
+        return _apply_branding_rename_pdf(result), count
     finally:
         doc.close()
 
@@ -790,8 +848,8 @@ def replace_multiple_logos_any(
 
 def _replace_text_in_xml(
     xml_bytes: bytes,
-    old_text: str,
-    new_text: str,
+    old_text: str = "",
+    new_text: str = "",
     extra_pairs: list[tuple[str, str]] | None = None,
 ) -> tuple[bytes, int]:
     """
@@ -802,12 +860,18 @@ def _replace_text_in_xml(
     Parameters
     ----------
     xml_bytes    : Raw bytes of the XML part.
-    old_text     : Primary string to search for.
+    old_text     : Primary string to search for (leave empty to skip).
     new_text     : Replacement for old_text.
     extra_pairs  : Additional (old, new) string pairs applied after the primary
                    replacement (e.g. for year normalisation).  Each pair is
                    applied as a plain string replacement on the already-combined
                    paragraph text.
+
+    Always-on pass:
+      Regardless of old_text / new_text, every call also renames any
+      capitalisation of "LTIMindtree" to "LTM" using the module-level
+      _LTIMINDTREE_RE regex.  This ensures the branding rename happens
+      in every document modification path without a separate UI step.
 
     How split runs are handled:
       Office stores visible strings across multiple <a:r>/<w:r> run elements.
@@ -819,7 +883,6 @@ def _replace_text_in_xml(
     Returns (modified_xml_bytes, replacement_count).
     If no changes are made the original bytes are returned (count=0).
     """
-    import re
     from lxml import etree
     # DrawingML namespace (PPTX text)
     _A     = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -850,8 +913,8 @@ def _replace_text_in_xml(
             full = "".join(t.text or "" for t in telems)
             original_full = full
 
-            # Apply the primary replacement
-            if old_text in full:
+            # Apply the primary replacement (only when a target was provided)
+            if old_text and old_text in full:
                 full   = full.replace(old_text, new_text)
                 count += original_full.count(old_text)
 
@@ -861,6 +924,12 @@ def _replace_text_in_xml(
                     if ep_old in full:
                         full   = full.replace(ep_old, ep_new)
                         count += 1
+
+            # Always-on: rename every capitalisation of "LTIMindtree" → "LTM"
+            branded = _LTIMINDTREE_RE.sub("LTM", full)
+            if branded != full:
+                full    = branded
+                count  += 1
 
             if full == original_full:
                 continue   # nothing changed in this paragraph
