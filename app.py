@@ -848,8 +848,8 @@ def replace_multiple_logos_any(
 
 def _replace_text_in_xml(
     xml_bytes: bytes,
-    old_text: str = "",
-    new_text: str = "",
+    old_text: str,
+    new_text: str,
     extra_pairs: list[tuple[str, str]] | None = None,
 ) -> tuple[bytes, int]:
     """
@@ -860,18 +860,12 @@ def _replace_text_in_xml(
     Parameters
     ----------
     xml_bytes    : Raw bytes of the XML part.
-    old_text     : Primary string to search for (leave empty to skip).
+    old_text     : Primary string to search for.
     new_text     : Replacement for old_text.
     extra_pairs  : Additional (old, new) string pairs applied after the primary
                    replacement (e.g. for year normalisation).  Each pair is
                    applied as a plain string replacement on the already-combined
                    paragraph text.
-
-    Always-on pass:
-      Regardless of old_text / new_text, every call also renames any
-      capitalisation of "LTIMindtree" to "LTM" using the module-level
-      _LTIMINDTREE_RE regex.  This ensures the branding rename happens
-      in every document modification path without a separate UI step.
 
     How split runs are handled:
       Office stores visible strings across multiple <a:r>/<w:r> run elements.
@@ -883,6 +877,7 @@ def _replace_text_in_xml(
     Returns (modified_xml_bytes, replacement_count).
     If no changes are made the original bytes are returned (count=0).
     """
+    import re
     from lxml import etree
     # DrawingML namespace (PPTX text)
     _A     = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -913,8 +908,8 @@ def _replace_text_in_xml(
             full = "".join(t.text or "" for t in telems)
             original_full = full
 
-            # Apply the primary replacement (only when a target was provided)
-            if old_text and old_text in full:
+            # Apply the primary replacement
+            if old_text in full:
                 full   = full.replace(old_text, new_text)
                 count += original_full.count(old_text)
 
@@ -924,12 +919,6 @@ def _replace_text_in_xml(
                     if ep_old in full:
                         full   = full.replace(ep_old, ep_new)
                         count += 1
-
-            # Always-on: rename every capitalisation of "LTIMindtree" → "LTM"
-            branded = _LTIMINDTREE_RE.sub("LTM", full)
-            if branded != full:
-                full    = branded
-                count  += 1
 
             if full == original_full:
                 continue   # nothing changed in this paragraph
